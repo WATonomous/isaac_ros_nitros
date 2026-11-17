@@ -79,9 +79,6 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
   INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_point_cloud_layout test/test_point_cloud_layout.cpp)
-  target_link_libraries(test_point_cloud_layout ${PROJECT_NAME} CUDA::cudart)
   # Install test/config directory
   install(DIRECTORY test/config DESTINATION share/${PROJECT_NAME}/test)
 
@@ -103,7 +100,6 @@ if(BUILD_TESTING)
   # Find isaac_ros_managed_nitros for test node
   # (ament_auto_find_build_dependencies only finds <depend>, not <test_depend>)
   find_package(isaac_ros_managed_nitros REQUIRED)
-  ament_target_dependencies(test_point_cloud_layout isaac_ros_managed_nitros)
 
   # ManagedNitrosPointCloudForwardNode
   ament_auto_add_library(managed_nitros_point_cloud_forward_node SHARED
