@@ -18,7 +18,7 @@
 #ifndef ISAAC_ROS_NITROS_POINT_CLOUD_TYPE__NITROS_POINT_CLOUD_GXF_COMPAT_HPP_
 #define ISAAC_ROS_NITROS_POINT_CLOUD_TYPE__NITROS_POINT_CLOUD_GXF_COMPAT_HPP_
 
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
 
 #include "isaac_ros_nitros/types/nitros_gxf_compat_traits.hpp"
 #include "gxf/core/gxf.h"
@@ -48,6 +48,6 @@ struct NitrosGxfCompatTraits<NitrosPointCloud>
 }  // namespace isaac_ros
 }  // namespace nvidia
 
-#endif  // NITROS_GXF_COMPAT_MODE
+#endif  // NITROS_POINT_CLOUD_GXF_COMPAT_MODE
 
 #endif  // ISAAC_ROS_NITROS_POINT_CLOUD_TYPE__NITROS_POINT_CLOUD_GXF_COMPAT_HPP_

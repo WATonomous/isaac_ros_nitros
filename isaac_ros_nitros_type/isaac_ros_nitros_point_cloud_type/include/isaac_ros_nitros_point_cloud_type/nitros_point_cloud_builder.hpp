@@ -46,6 +46,10 @@ public:
     const void * points_data, int32_t num_points,
     bool use_color = false);
 
+  // The PointCloud2 argument supplies metadata only; points_data is already on the GPU.
+  NitrosPointCloudBuilder &WithPoints(const void *points_data,
+                                      const sensor_msgs::msg::PointCloud2 &layout);
+
   NitrosPointCloudBuilder & WithEvent(cudaEvent_t event);
 
   NitrosPointCloudBuilder & WithReleaseCallback(std::function<void()> release_callback);
@@ -58,6 +62,7 @@ private:
   const void * points_data_{nullptr};
   int32_t num_points_{0};
   bool use_color_{false};
+  bool has_layout_{false};
   std_msgs::msg::Header header_{};
   cudaEvent_t event_{};
   std::function<void()> release_callback_{nullptr};

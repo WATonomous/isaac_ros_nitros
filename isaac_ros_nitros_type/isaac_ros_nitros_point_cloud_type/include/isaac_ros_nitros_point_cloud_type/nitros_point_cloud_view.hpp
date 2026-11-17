@@ -36,12 +36,23 @@ NITROS_TYPE_VIEW_FACTORY_BEGIN_NO_GXF(NitrosPointCloud)
 MARK_PUBLIC_SECTION()
 inline uint32_t GetWidth() const {return msg_.width;}
 inline uint32_t GetHeight() const {return msg_.height;}
+inline size_t GetDataSize() const
+{
+  return msg_.get_buffer_size();
+}
 inline uint32_t GetPointCount() const {return msg_.width * msg_.height;}
 inline bool HasColor() const {return msg_.use_color;}
 inline uint32_t GetPointStep() const {return msg_.point_step;}
 inline uint32_t GetRowStep() const {return msg_.row_step;}
 inline bool IsBigEndian() const {return msg_.is_bigendian;}
-inline bool IsDense() const {return false;}
+inline bool IsDense() const
+{
+  return msg_.is_dense;
+}
+inline const std::vector<sensor_msgs::msg::PointField> &GetFields() const
+{
+  return msg_.fields;
+}
 
 inline const float * GetPointsData() const
 {

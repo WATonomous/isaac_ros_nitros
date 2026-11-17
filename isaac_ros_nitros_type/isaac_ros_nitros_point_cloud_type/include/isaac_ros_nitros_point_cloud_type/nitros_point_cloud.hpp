@@ -23,25 +23,23 @@
  *   ROS type:    sensor_msgs::msg::PointCloud2
  */
 
-#ifndef NITROS_GXF_COMPAT_MODE
-#define NITROS_GXF_COMPAT_MODE
-#endif
-
+#include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "isaac_ros_nitros/types/cuda_memory_pool.hpp"
+#include "isaac_ros_nitros/types/nitros_buffer.hpp"
 #include "isaac_ros_nitros/types/nitros_format_agent.hpp"
 #include "isaac_ros_nitros/types/nitros_type_base.hpp"
-#include "isaac_ros_nitros/types/nitros_buffer.hpp"
-#include "isaac_ros_nitros/types/cuda_memory_pool.hpp"
 #include "rclcpp/type_adapter.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
 #include "isaac_ros_nitros_point_cloud_type/nitros_point_cloud_gxf_compat.hpp"
 #endif
 
@@ -51,6 +49,68 @@ namespace isaac_ros
 {
 namespace nitros
 {
+
+// Buffer-based clouds preserve the complete PointCloud2 layout, including row padding.
+inline std::vector<sensor_msgs::msg::PointField> PointCloudFields(bool color)
+{
+  std::vector<sensor_msgs::msg::PointField> fields(color ? 4 : 3);
+  const char *names[] = {"x", "y", "z", "rgb"};
+  for (size_t i = 0; i < fields.size(); ++i)
+  {
+    fields[i].name = names[i];
+    fields[i].offset = static_cast<uint32_t>(i * sizeof(float));
+    fields[i].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    fields[i].count = 1;
+  }
+  return fields;
+}
+
+inline size_t ValidatePointCloudLayout(uint32_t width, uint32_t height, uint32_t point_step,
+                                       uint32_t row_step,
+                                       const std::vector<sensor_msgs::msg::PointField> &fields)
+{
+  if ((width && height && point_step == 0) || static_cast<uint64_t>(width) * point_step > row_step)
+  {
+    throw std::invalid_argument("Invalid PointCloud2 point/row stride");
+  }
+  for (const auto &field : fields)
+  {
+    size_t size = 0;
+    switch (field.datatype)
+    {
+      case 1:
+      case 2:
+        size = 1;
+        break;
+      case 3:
+      case 4:
+        size = 2;
+        break;
+      case 5:
+      case 6:
+      case 7:
+        size = 4;
+        break;
+      case 8:
+        size = 8;
+        break;
+      default:
+        throw std::invalid_argument("Invalid PointCloud2 field datatype");
+    }
+    if (!field.count ||
+        static_cast<uint64_t>(field.offset) + static_cast<uint64_t>(field.count) * size >
+            point_step)
+    {
+      throw std::invalid_argument("PointCloud2 field exceeds point_step");
+    }
+  }
+  const uint64_t bytes = static_cast<uint64_t>(row_step) * height;
+  if (bytes > std::numeric_limits<size_t>::max())
+  {
+    throw std::invalid_argument("PointCloud2 payload size overflow");
+  }
+  return static_cast<size_t>(bytes);
+}
 
 // Type forward declaration
 struct NitrosPointCloud;
@@ -70,7 +130,7 @@ public:
   {
     return "nitros_point_cloud";
   }
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
   static std::map<std::string, NitrosFormatCallbacks> GetFormatCallbacks()
   {
     std::map<std::string, NitrosFormatCallbacks> format_callback_map;
@@ -104,6 +164,7 @@ public:
   uint32_t get_width() const {return width;}
   uint32_t get_height() const {return height;}
   uint32_t get_point_step() const {return point_step;}
+  size_t get_buffer_size() const { return buffer_ ? buffer_->size() : 0; }
 
   // Timestamp accessors
   uint32_t get_timestamp_sec() const override {return timestamp_sec;}
@@ -117,6 +178,10 @@ public:
   // Get read handle for consuming image data on the specified stream
   nvidia::isaac_ros::nitros::ReadHandle get_read_handle(cudaStream_t stream) const
   {
+    if (!buffer_)
+    {
+      throw std::invalid_argument("Point cloud has no GPU buffer");
+    }
     return buffer_->get_read_handle(stream);
   }
 
@@ -145,6 +210,8 @@ public:
     this->row_step = row_step;
     this->is_bigendian = is_bigendian;
     this->use_color = use_color;
+    this->fields = PointCloudFields(use_color);
+    this->is_dense = false;
     handle = -1;
     return buffer_->get_write_handle(stream);
   }
@@ -175,6 +242,8 @@ public:
     this->row_step = row_step;
     this->is_bigendian = is_bigendian;
     this->use_color = use_color;
+    this->fields = PointCloudFields(use_color);
+    this->is_dense = false;
     handle = -1;
     return buffer_->get_write_handle(stream);
   }
@@ -186,6 +255,8 @@ public:
   uint32_t row_step{0};
   bool is_bigendian{false};
   bool use_color{false};
+  bool is_dense{false};
+  std::vector<sensor_msgs::msg::PointField> fields;
   uint32_t timestamp_sec{0};
   uint32_t timestamp_nsec{0};
   std::string frame_id;
@@ -197,6 +268,18 @@ private:
   // Implementation details (private, accessed via NitrosBufferAccessor)
   std::shared_ptr<nvidia::isaac_ros::nitros::NitrosBuffer> buffer_;
 };
+
+// The legacy representation has no field metadata. Validate before any GXF allocation.
+inline void ValidateLegacyPointCloudLayout(const NitrosPointCloud &msg)
+{
+  if (msg.fields != PointCloudFields(msg.use_color) ||
+      msg.point_step != (msg.use_color ? 16u : 12u) ||
+      static_cast<uint64_t>(msg.width) * msg.point_step != msg.row_step ||
+      static_cast<uint64_t>(msg.width) * msg.height > INT32_MAX)
+  {
+    throw std::invalid_argument("Legacy GXF point clouds support packed XYZ/XYZRGB only");
+  }
+}
 
 }  // namespace nitros
 }  // namespace isaac_ros

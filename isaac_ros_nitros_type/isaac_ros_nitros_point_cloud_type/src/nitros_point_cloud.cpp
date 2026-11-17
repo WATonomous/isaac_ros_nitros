@@ -25,7 +25,7 @@
 #include "isaac_ros_nitros/types/cuda_stream_pool.hpp"
 #include "isaac_ros_nitros_point_cloud_type/nitros_point_cloud.hpp"
 
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
 #include "isaac_ros_nitros/types/type_adapter_nitros_context.hpp"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -51,7 +51,7 @@ void rclcpp::TypeAdapter<
     rclcpp::get_logger("NitrosPointCloud"),
     "[convert_to_ros_message] Conversion started for handle=%ld", source.handle);
 
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
   if (source.handle >= 0) {
     auto context = nvidia::isaac_ros::nitros::GetTypeAdapterNitrosContext().getContext();
     auto entity = nvidia::gxf::Entity::Shared(context, source.handle);
@@ -111,83 +111,30 @@ void rclcpp::TypeAdapter<
   }
 #endif
 
-  // RAII handle: declared BEFORE read_handle so reverse-destruction order
-  // lets read_handle record its CUDA event before the stream returns to the
-  // pool. Returns the stream to the pool on every exit path (success and
-  // exception), fixing a leak where the success path never released the
-  // stream and the pool was permanently exhausted after ~32 messages.
-  auto stream_handle =
-    nvidia::isaac_ros::nitros::CudaStreamPool::instance().get_stream_handle();
-  cudaStream_t stream = stream_handle.get();
-
-  // Use read handle for proper event synchronization
-  auto read_handle = source.get_read_handle(stream);
-  const uint8_t * dev_ptr = read_handle.get_ptr();
-  if (dev_ptr == nullptr) {
-    throw std::invalid_argument("NitrosPointCloud device pointer is nullptr");
-  }
-
   destination.height = source.height;
   destination.width = source.width;
   destination.point_step = source.point_step;
   destination.row_step = source.row_step;
   destination.is_bigendian = source.is_bigendian;
-  destination.is_dense = false;
-
-  sensor_msgs::PointCloud2Modifier pc2_modifier(destination);
-  if (source.use_color) {
-    // Data format: x,y,z,rgb; 16 bytes per point
-    pc2_modifier.setPointCloud2Fields(
-      4,
-      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-      "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-      "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
-  } else {
-    // Data format: x,y,z; 12 bytes per point
-    pc2_modifier.setPointCloud2Fields(
-      3,
-      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-      "z", 1, sensor_msgs::msg::PointField::FLOAT32);
+  destination.is_dense = source.is_dense;
+  destination.fields = source.fields;
+  const size_t bytes = nvidia::isaac_ros::nitros::ValidatePointCloudLayout(
+      source.width, source.height, source.point_step, source.row_step, source.fields);
+  if (bytes > source.get_buffer_size())
+  {
+    throw std::invalid_argument("PointCloud2 metadata exceeds GPU buffer size");
   }
-
-  destination.data.resize(destination.row_step * destination.height);
-  const cudaError_t cuda_error = cudaMemcpyAsync(
-    destination.data.data(),
-    dev_ptr, destination.row_step * destination.height,
-    cudaMemcpyDeviceToHost, stream);
-  if (cuda_error != cudaSuccess) {
-    std::stringstream error_msg;
-    error_msg <<
-      "[convert_to_ros_message] cudaMemcpy failed for conversion from "
-      "NitrosPointCloud to sensor_msgs::msg::PointCloud2: " <<
-      cudaGetErrorName(cuda_error) <<
-      " (" << cudaGetErrorString(cuda_error) << ")";
-    RCLCPP_ERROR(
-      rclcpp::get_logger("NitrosPointCloud"), error_msg.str().c_str());
-    throw std::runtime_error(error_msg.str().c_str());
+  destination.data.resize(bytes);
+  if (bytes)
+  {
+    auto stream_handle = nvidia::isaac_ros::nitros::CudaStreamPool::instance().get_stream_handle();
+    auto stream = stream_handle.get();
+    auto read_handle = source.get_read_handle(stream);
+    CHECK_CUDA_ERROR(cudaMemcpyAsync(destination.data.data(), read_handle.get_ptr(), bytes,
+                                     cudaMemcpyDeviceToHost, stream),
+                     "PointCloud2 download failed");
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream), "PointCloud2 download synchronization failed");
   }
-  cudaError_t cuda_err = cudaStreamSynchronize(stream);
-  if (cuda_err != cudaSuccess) {
-    std::stringstream error_msg;
-    error_msg << "[convert_to_ros_message] cudaStreamSynchronize failed: " <<
-      cudaGetErrorName(cuda_err) << " (" << cudaGetErrorString(cuda_err) << ")";
-    RCLCPP_ERROR(rclcpp::get_logger("NitrosPointCloud"), error_msg.str().c_str());
-    throw std::runtime_error(error_msg.str().c_str());
-  }
-
-  RCLCPP_DEBUG(
-    rclcpp::get_logger("NitrosPointCloud"),
-    "[convert_to_ros_message] "
-    "height: %u, width: %u, row_step: %u, point_step: %u, x_offset: %u, y_offset: %u, z_offset: %u",
-    destination.height,
-    destination.width,
-    destination.row_step,
-    destination.point_step,
-    destination.fields[0].offset,
-    destination.fields[1].offset,
-    destination.fields[2].offset);
 
   // Populate timestamp information back into ROS header
   destination.header.stamp.sec = source.timestamp_sec;
@@ -215,65 +162,60 @@ void rclcpp::TypeAdapter<
     rclcpp::get_logger("NitrosPointCloud"),
     "[convert_to_custom] Conversion started");
 
-  auto & stream_pool = nvidia::isaac_ros::nitros::CudaStreamPool::instance();
-  cudaStream_t stream = stream_pool.acquire();
-
-  const int32_t height = source.height;
-  const int32_t width = source.width;
-  const int32_t point_float_count = source.point_step / sizeof(float);
-  const bool use_color = (point_float_count == 4);  // {x, y, z, RGB}
-  const size_t total_bytes = height * width * point_float_count * sizeof(float);
-
-  nvidia::isaac_ros::nitros::NitrosPointCloud point_cloud;
-  uint8_t * dptr = nullptr;
-  cudaError_t cuda_err = cudaMallocAsync(reinterpret_cast<void **>(&dptr), total_bytes, stream);
-  if (cuda_err != cudaSuccess) {
-    stream_pool.release(stream);
-    std::stringstream error_msg;
-    error_msg <<
-      "[convert_to_custom] cudaMallocAsync failed: " <<
-      cudaGetErrorName(cuda_err) << " (" << cudaGetErrorString(cuda_err) << ")";
-    RCLCPP_ERROR(rclcpp::get_logger("NitrosPointCloud"), error_msg.str().c_str());
-    throw std::runtime_error(error_msg.str().c_str());
+  using namespace nvidia::isaac_ros::nitros;
+  const size_t total_bytes = ValidatePointCloudLayout(
+      source.width, source.height, source.point_step, source.row_step, source.fields);
+  if (source.data.size() != total_bytes)
+  {
+    throw std::invalid_argument("PointCloud2 data size does not match row_step * height");
   }
 
+  NitrosPointCloud point_cloud;
+  if (total_bytes)
   {
-    auto deleter = [stream, &stream_pool](uint8_t * p){
-        if (p) {
-          cudaFreeAsync(p, stream);
-        }
-        if (stream) {
-          stream_pool.release(stream);
-        }
-      };
-
-    auto write_handle = point_cloud.from_external(
-      dptr, total_bytes, width, height, source.point_step, source.row_step, source.is_bigendian,
-      use_color, stream, deleter);
-
-    cuda_err = cudaMemcpyAsync(write_handle.get_ptr(), source.data.data(), total_bytes,
-      cudaMemcpyHostToDevice, stream);
-    if (cuda_err != cudaSuccess) {
-      std::stringstream error_msg;
-      error_msg <<
-        "[convert_to_custom] cudaMemcpyAsync H2D failed: " <<
-        cudaGetErrorName(cuda_err) << " (" << cudaGetErrorString(cuda_err) << ")";
-      RCLCPP_ERROR(rclcpp::get_logger("NitrosPointCloud"), error_msg.str().c_str());
-      throw std::runtime_error(error_msg.str().c_str());
+    auto stream_handle = CudaStreamPool::instance().get_stream_handle();
+    auto stream = stream_handle.get();
+    uint8_t *dptr = nullptr;
+    CHECK_CUDA_ERROR(cudaMalloc(reinterpret_cast<void **>(&dptr), total_bytes),
+                     "PointCloud2 allocation failed");
+    // from_external takes ownership; a shared buffer survives copies through message_filters.
+    try
+    {
+      {
+        auto write_handle = point_cloud.from_external(
+            dptr, total_bytes, source.width, source.height, source.point_step, source.row_step,
+            source.is_bigendian, false, stream);
+        dptr = nullptr;
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(write_handle.get_ptr(), source.data.data(), total_bytes,
+                                         cudaMemcpyHostToDevice, stream),
+                         "PointCloud2 upload failed");
+      }
+      // The ROS source may be destroyed on return: finish reading its host storage first.
+      CHECK_CUDA_ERROR(cudaStreamSynchronize(stream), "PointCloud2 upload synchronization failed");
+    }
+    catch (...)
+    {
+      if (dptr)
+      {
+        cudaFree(dptr);
+      }
+      throw;
     }
   }
-
+  point_cloud.width = source.width;
+  point_cloud.height = source.height;
+  point_cloud.point_step = source.point_step;
+  point_cloud.row_step = source.row_step;
+  point_cloud.is_bigendian = source.is_bigendian;
+  point_cloud.is_dense = source.is_dense;
+  point_cloud.fields = source.fields;
+  point_cloud.use_color =
+      std::any_of(source.fields.begin(), source.fields.end(),
+                  [](const auto &field) { return field.name == "rgb" || field.name == "rgba"; });
+  point_cloud.timestamp_sec = source.header.stamp.sec;
+  point_cloud.timestamp_nsec = source.header.stamp.nanosec;
+  point_cloud.frame_id = source.header.frame_id;
   destination = std::move(point_cloud);
-  destination.width = source.width;
-  destination.height = source.height;
-  destination.point_step = source.point_step;
-  destination.row_step = source.row_step;
-  destination.is_bigendian = source.is_bigendian;
-  destination.use_color = use_color;
-
-  destination.timestamp_sec = source.header.stamp.sec;
-  destination.timestamp_nsec = source.header.stamp.nanosec;
-  destination.frame_id = source.header.frame_id;
 
   RCLCPP_DEBUG(
     rclcpp::get_logger("NitrosPointCloud"),

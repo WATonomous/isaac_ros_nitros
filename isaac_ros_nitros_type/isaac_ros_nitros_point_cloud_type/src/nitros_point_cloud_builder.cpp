@@ -44,6 +44,7 @@ NitrosPointCloudBuilder::NitrosPointCloudBuilder(NitrosPointCloudBuilder && othe
   points_data_ = other.points_data_;
   num_points_ = other.num_points_;
   use_color_ = other.use_color_;
+  has_layout_ = other.has_layout_;
   header_ = other.header_;
   event_ = other.event_;
   release_callback_ = other.release_callback_;
@@ -66,6 +67,7 @@ NitrosPointCloudBuilder & NitrosPointCloudBuilder::operator=(NitrosPointCloudBui
   points_data_ = other.points_data_;
   num_points_ = other.num_points_;
   use_color_ = other.use_color_;
+  has_layout_ = other.has_layout_;
   header_ = other.header_;
   event_ = other.event_;
   release_callback_ = other.release_callback_;
@@ -122,7 +124,33 @@ NitrosPointCloudBuilder & NitrosPointCloudBuilder::WithPoints(
   points_data_ = points_data;
   num_points_ = num_points;
   use_color_ = use_color;
+  has_layout_ = false;
 
+  return *this;
+}
+
+NitrosPointCloudBuilder &NitrosPointCloudBuilder::WithPoints(
+    const void *points_data, const sensor_msgs::msg::PointCloud2 &layout)
+{
+  ValidatePointCloudLayout(layout.width, layout.height, layout.point_step, layout.row_step,
+                           layout.fields);
+  const uint64_t count = static_cast<uint64_t>(layout.width) * layout.height;
+  if (!points_data || !count || count > static_cast<uint64_t>(INT32_MAX))
+  {
+    throw std::invalid_argument("Invalid GPU point cloud buffer or point count");
+  }
+  points_data_ = points_data;
+  num_points_ = static_cast<int32_t>(count);
+  has_layout_ = true;
+  nitros_point_cloud_.width = layout.width;
+  nitros_point_cloud_.height = layout.height;
+  nitros_point_cloud_.point_step = layout.point_step;
+  nitros_point_cloud_.row_step = layout.row_step;
+  nitros_point_cloud_.is_bigendian = layout.is_bigendian;
+  nitros_point_cloud_.is_dense = layout.is_dense;
+  nitros_point_cloud_.fields = layout.fields;
+  use_color_ = std::any_of(layout.fields.begin(), layout.fields.end(), [](const auto &field)
+                           { return field.name == "rgb" || field.name == "rgba"; });
   return *this;
 }
 
@@ -169,11 +197,20 @@ NitrosPointCloud NitrosPointCloudBuilder::Build()
     }
   }
 
-  const uint32_t width = static_cast<uint32_t>(num_points_);
-  const uint32_t height = 1u;
-  const uint32_t point_step = use_color_ ? 16u : 12u;
-  const uint32_t row_step = point_step * width;
-  const size_t buffer_size = static_cast<size_t>(point_step) * width * height;
+  const uint32_t width =
+      has_layout_ ? nitros_point_cloud_.width : static_cast<uint32_t>(num_points_);
+  const uint32_t height = has_layout_ ? nitros_point_cloud_.height : 1u;
+  const uint32_t point_step =
+      has_layout_ ? nitros_point_cloud_.point_step : (use_color_ ? 16u : 12u);
+  if (static_cast<uint64_t>(point_step) * width > UINT32_MAX)
+  {
+    throw std::invalid_argument("Point cloud row stride overflow");
+  }
+  const uint32_t row_step = has_layout_ ? nitros_point_cloud_.row_step : point_step * width;
+  const bool bigendian = has_layout_ && nitros_point_cloud_.is_bigendian;
+  const bool dense = has_layout_ && nitros_point_cloud_.is_dense;
+  const auto fields = has_layout_ ? nitros_point_cloud_.fields : PointCloudFields(use_color_);
+  const size_t buffer_size = ValidatePointCloudLayout(width, height, point_step, row_step, fields);
 
   auto & stream_pool = nvidia::isaac_ros::nitros::CudaStreamPool::instance();
   cudaStream_t cuda_stream = stream_pool.acquire();
@@ -190,11 +227,11 @@ NitrosPointCloud NitrosPointCloudBuilder::Build()
     };
 
   [[maybe_unused]] auto write_handle = nitros_point_cloud_.from_external(
-    const_cast<void *>(points_data_), buffer_size,
-    width, height, point_step, row_step,
-    false /* is_bigendian */, use_color_,
-    cuda_stream, deleter);
+      const_cast<void *>(points_data_), buffer_size, width, height, point_step, row_step, bigendian,
+      use_color_, cuda_stream, deleter);
 
+  nitros_point_cloud_.fields = fields;
+  nitros_point_cloud_.is_dense = dense;
   nitros_point_cloud_.frame_id = header_.frame_id;
   nitros_point_cloud_.timestamp_sec = header_.stamp.sec;
   nitros_point_cloud_.timestamp_nsec = header_.stamp.nanosec;
