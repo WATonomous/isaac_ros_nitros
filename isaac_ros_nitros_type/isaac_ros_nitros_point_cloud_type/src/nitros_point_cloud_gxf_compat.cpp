@@ -15,7 +15,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#ifdef NITROS_GXF_COMPAT_MODE
+#ifdef NITROS_POINT_CLOUD_GXF_COMPAT_MODE
 
 #include <cuda_runtime.h>
 
@@ -81,6 +81,7 @@ NitrosPointCloud NitrosGxfCompatTraits<NitrosPointCloud>::CreateFromGxfEntity(
   msg.is_bigendian = parts.info->is_bigendian;
   msg.point_step = msg.use_color ? 16u : 12u;
   msg.row_step = msg.point_step * msg.width;
+  msg.fields = PointCloudFields(msg.use_color);
 
   if (parts.timestamp) {
     uint64_t acqtime = parts.timestamp->acqtime;
@@ -101,6 +102,8 @@ int64_t NitrosGxfCompatTraits<NitrosPointCloud>::CreateGxfEntity(
     GxfEntityRefCountInc(context, static_cast<gxf_uid_t>(msg.handle));
     return msg.handle;
   }
+
+  ValidateLegacyPointCloudLayout(msg);
 
   // Buffer-based: create GXF entity and copy buffer into it
   gxf_uid_t cid;
@@ -178,4 +181,4 @@ NITROS_GXF_COMPAT_REGISTER_CONVERTER(NitrosPointCloud)
 }  // namespace isaac_ros
 }  // namespace nvidia
 
-#endif  // NITROS_GXF_COMPAT_MODE
+#endif  // NITROS_POINT_CLOUD_GXF_COMPAT_MODE
